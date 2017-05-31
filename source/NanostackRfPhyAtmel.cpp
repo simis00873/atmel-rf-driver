@@ -22,6 +22,7 @@
 #include "AT86RFReg.h"
 #include "nanostack/platform/arm_hal_phy.h"
 #include "mbed_toolchain.h"
+#include "events/mbed_shared_queues.h"
 
 /*Worst case sensitivity*/
 #define RF_DEFAULT_SENSITIVITY -88
@@ -212,17 +213,8 @@ static void rf_if_disable_irq(void);
 
 #ifdef MBED_CONF_RTOS_PRESENT
 #include "mbed.h"
-#include "rtos.h"
 
 static void rf_if_irq_task_process_irq();
-
-#define SIG_RADIO       1
-#define SIG_TIMER_ACK   2
-#define SIG_TIMER_CAL   4
-#define SIG_TIMER_CCA   8
-
-#define SIG_TIMERS (SIG_TIMER_ACK|SIG_TIMER_CAL|SIG_TIMER_CCA)
-#define SIG_ALL (SIG_RADIO|SIG_TIMERS)
 #endif
 
 // HW pins to RF chip
@@ -250,9 +242,7 @@ public:
     Timeout cal_timer;
     Timeout cca_timer;
 #ifdef MBED_CONF_RTOS_PRESENT
-    Thread irq_thread;
-    Mutex mutex;
-    void rf_if_irq_task();
+    EventQueue *equeue;
 #endif
 };
 
@@ -264,12 +254,9 @@ RFBits::RFBits(PinName spi_mosi, PinName spi_miso,
         RST(spi_rst),
         SLP_TR(spi_slp),
         IRQ(spi_irq)
-#ifdef MBED_CONF_RTOS_PRESENT
-,irq_thread(osPriorityRealtime, 1024)
-#endif
 {
 #ifdef MBED_CONF_RTOS_PRESENT
-    irq_thread.start(mbed::callback(this, &RFBits::rf_if_irq_task));
+    equeue = mbed_highprio_event_queue();
 #endif
 }
 
@@ -280,6 +267,9 @@ static int8_t rf_rssi_base_val = -91;
 
 static uint8_t rf_if_spi_exchange(uint8_t out);
 
+/* Lock against background operations (disable interrupts, or claim the
+ * background mutex).
+ */
 static void rf_if_lock(void)
 {
     platform_enter_critical();
@@ -290,20 +280,37 @@ static void rf_if_unlock(void)
     platform_exit_critical();
 }
 
+/* Perform lock from a background operation (nothing, if background are
+ * interrupts, else claim the background mutex)
+ */
+static void rf_if_lock_in_bg(void)
+{
+#ifdef MBED_CONF_RTOS_PRESENT
+    rf_if_lock();
+#endif
+}
+
+static void rf_if_unlock_in_bg(void)
+{
+#ifdef MBED_CONF_RTOS_PRESENT
+    rf_if_unlock();
+#endif
+}
+
 #ifdef MBED_CONF_RTOS_PRESENT
 static void rf_if_cca_timer_signal(void)
 {
-    rf->irq_thread.signal_set(SIG_TIMER_CCA);
+    rf->equeue->call(rf_cca_timer_interrupt);
 }
 
 static void rf_if_cal_timer_signal(void)
 {
-    rf->irq_thread.signal_set(SIG_TIMER_CAL);
+    rf->equeue->call(rf_calibration_timer_interrupt);
 }
 
 static void rf_if_ack_timer_signal(void)
 {
-    rf->irq_thread.signal_set(SIG_TIMER_ACK);
+    rf->equeue->call(rf_ack_wait_timer_interrupt);
 }
 #endif
 
@@ -1079,33 +1086,7 @@ static void rf_if_disable_irq(void)
 #ifdef MBED_CONF_RTOS_PRESENT
 static void rf_if_interrupt_handler(void)
 {
-    rf->irq_thread.signal_set(SIG_RADIO);
-}
-
-// Started during construction of rf, so variable
-// rf isn't set at the start. Uses 'this' instead.
-void RFBits::rf_if_irq_task(void)
-{
-    for (;;) {
-        osEvent event = irq_thread.signal_wait(0);
-        if (event.status != osEventSignal) {
-            continue;
-        }
-        rf_if_lock();
-        if (event.value.signals & SIG_RADIO) {
-            rf_if_irq_task_process_irq();
-        }
-        if (event.value.signals & SIG_TIMER_ACK) {
-            rf_ack_wait_timer_interrupt();
-        }
-        if (event.value.signals & SIG_TIMER_CCA) {
-            rf_cca_timer_interrupt();
-        }
-        if (event.value.signals & SIG_TIMER_CAL) {
-            rf_calibration_timer_interrupt();
-        }
-        rf_if_unlock();
-    }
+    rf->equeue->call(rf_if_irq_task_process_irq);
 }
 
 static void rf_if_irq_task_process_irq(void)
@@ -1121,6 +1102,8 @@ static void rf_if_interrupt_handler(void)
 #endif
 {
   uint8_t irq_status;
+
+  rf_if_lock_in_bg();
 
   /*Read interrupt flag*/
   irq_status = rf_if_read_register(IRQ_STATUS);
@@ -1156,6 +1139,8 @@ static void rf_if_interrupt_handler(void)
   {
     rf_handle_cca_ed_done();
   }
+
+  rf_if_unlock_in_bg();
 }
 
 /*
@@ -1352,10 +1337,14 @@ static void rf_ack_wait_timer_interrupt(void)
  */
 static void rf_calibration_timer_interrupt(void)
 {
+    rf_if_lock_in_bg();
+
     /*Calibrate RF*/
     rf_calibration_cb();
     /*Start new calibration timeout*/
     rf_calibration_timer_start(RF_CALIBRATION_INTERVAL);
+
+    rf_if_unlock_in_bg();
 }
 
 /*
@@ -1367,6 +1356,8 @@ static void rf_calibration_timer_interrupt(void)
  */
 static void rf_cca_timer_interrupt(void)
 {
+    rf_if_lock_in_bg();
+
     /*Disable reception - locks against entering BUSY_RX and overwriting frame buffer*/
     rf_enable_static_frame_buffer_protection();
 
@@ -1389,6 +1380,8 @@ static void rf_cca_timer_interrupt(void)
         rf_if_enable_cca_ed_done_interrupt();
         rf_if_start_cca_process();
     }
+
+    rf_if_unlock_in_bg();
 }
 
 /*
