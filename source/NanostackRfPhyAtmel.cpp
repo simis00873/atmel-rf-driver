@@ -21,6 +21,7 @@
 #include "randLIB.h"
 #include "AT86RFReg.h"
 #include "nanostack/platform/arm_hal_phy.h"
+#include "mbed_error.h"
 #include "mbed_toolchain.h"
 
 /*Worst case sensitivity*/
@@ -726,7 +727,7 @@ static void rf_if_write_rf_settings(void)
   /* Auto CRC on, IRQ status shows unmasked only, TRX_STATUS output on all accesses */
   rf_if_write_register(TRX_CTRL_1, TX_AUTO_CRC_ON | SPI_CMD_MODE_TRX_STATUS);
 
-  rf_if_write_register(IRQ_MASK, CCA_ED_DONE | TRX_END);
+  rf_if_write_register(IRQ_MASK, CCA_ED_DONE | TRX_END | TRX_UR);
 
   xah_ctrl_1 = rf_if_read_register(XAH_CTRL_1);
 
@@ -1108,6 +1109,10 @@ static void rf_if_interrupt_handler(void)
   if(irq_status & CCA_ED_DONE)
   {
     rf_handle_cca_ed_done(full_trx_status);
+  }
+  if (irq_status & TRX_UR)
+  {
+    error("TRX_UR");
   }
 }
 
